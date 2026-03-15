@@ -260,7 +260,7 @@ const markOneAsRead = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Invalid notification ID');
   }
 
-  const notification = await Notification.findOneAndUpdate(
+  const notification = await NotificationModel.findOneAndUpdate(
     { _id: id, recipientId: req.user._id },
     { $set: { isRead: true, readAt: new Date() } },
     { new: true }
@@ -276,7 +276,7 @@ const markOneAsRead = asyncHandler(async (req, res) => {
  * PATCH /api/notifications/read-all
  */
 const markAllAsRead = asyncHandler(async (req, res) => {
-  const result = await Notification.updateMany(
+  const result = await NotificationModel.updateMany(
     { recipientId: req.user._id, isRead: false },
     { $set: { isRead: true, readAt: new Date() } }
   );
@@ -299,7 +299,7 @@ const deleteNotification = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Invalid notification ID');
   }
 
-  const notification = await Notification.findOneAndDelete({
+  const notification = await NotificationModel.findOneAndDelete({
     _id:         id,
     recipientId: req.user._id,
   });
