@@ -3,10 +3,12 @@ const User = require('../user/user.model');
 const ApiError = require('../../utils/ApiError');
 const asyncHandler = require('../../utils/asyncHandler');
 const { generateAccessToken, generateRefreshToken, verifyRefreshToken } = require('../../utils/tokens');
+const { subscribeToTopic, unsubscribeFromTopic } = require('../../utils/notify.js');
+const Subscription = require('../../modules/subscription/subscription.model.js');
+const admin = require('../../config/firebase');
 
 // ── POST /api/auth/register ───────────────────
 const register = asyncHandler(async (req, res) => {
-  // 1. Check validation errors
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ success: false, errors: errors.array() });
@@ -18,11 +20,9 @@ const register = asyncHandler(async (req, res) => {
     app, colorHex, felicitation, leadField,
   } = req.body;
 
-  // 2. Check duplicate email
   const existing = await User.findOne({ email });
   if (existing) throw new ApiError(409, 'Email already registered');
 
-  // 3. Create user
   const user = await User.create({
     name, email, password,
     role:         role         || 'member',
@@ -34,11 +34,9 @@ const register = asyncHandler(async (req, res) => {
     leadField:    leadField    || null,
   });
 
-  // 4. Generate tokens
   const accessToken  = generateAccessToken(user._id);
   const refreshToken = generateRefreshToken(user._id);
 
-  // 5. Save refresh token
   user.refreshTokens = [refreshToken];
   await user.save({ validateBeforeSave: false });
 
@@ -60,24 +58,19 @@ const login = asyncHandler(async (req, res) => {
 
   const { email, password } = req.body;
 
-  // 1. Find user + select password
   const user = await User.findOne({ email }).select('+password +refreshTokens');
   if (!user) throw new ApiError(401, 'Invalid email or password');
 
-  // 2. Check password
   const isMatch = await user.comparePassword(password);
   if (!isMatch) throw new ApiError(401, 'Invalid email or password');
 
-  // 3. Check if account is active
   if (user.status === 'inactive') {
     throw new ApiError(403, 'Account deactivated. Contact admin.');
   }
 
-  // 4. Generate tokens
   const accessToken  = generateAccessToken(user._id);
   const refreshToken = generateRefreshToken(user._id);
 
-  // 5. Allow up to 5 devices — store new refresh token
   const tokens = user.refreshTokens || [];
   user.refreshTokens = [...tokens.slice(-4), refreshToken];
   await user.save({ validateBeforeSave: false });
@@ -96,7 +89,6 @@ const refresh = asyncHandler(async (req, res) => {
   const { refreshToken } = req.body;
   if (!refreshToken) throw new ApiError(400, 'Refresh token required');
 
-  // 1. Verify the token
   let decoded;
   try {
     decoded = verifyRefreshToken(refreshToken);
@@ -104,18 +96,16 @@ const refresh = asyncHandler(async (req, res) => {
     throw new ApiError(401, 'Invalid or expired refresh token');
   }
 
-  // 2. Find user + check token is stored
   const user = await User.findById(decoded.id).select('+refreshTokens');
   if (!user || !user.refreshTokens.includes(refreshToken)) {
     throw new ApiError(401, 'Refresh token revoked');
   }
 
-  // 3. Rotate — replace old with new
   const newAccessToken  = generateAccessToken(user._id);
   const newRefreshToken = generateRefreshToken(user._id);
 
   user.refreshTokens = user.refreshTokens
-    .filter(t => t !== refreshToken)
+    .filter((t) => t !== refreshToken)
     .concat(newRefreshToken);
   await user.save({ validateBeforeSave: false });
 
@@ -127,12 +117,47 @@ const refresh = asyncHandler(async (req, res) => {
 });
 
 // ── POST /api/auth/logout ─────────────────────
+/*
+ * On logout:
+ * 1. Remove refresh token
+ * 2. Unsubscribe all active FCM topics in Firebase
+ * 3. Null deviceToken snapshots in Subscription docs
+ * 4. Clear fcmToken on user
+ *
+ * Subscription DOCS are kept — they're the recovery registry.
+ * On next login + PUT /api/notifications/token, all topics
+ * are automatically resubscribed.
+ */
 const logout = asyncHandler(async (req, res) => {
   const { refreshToken } = req.body;
 
-  const user = await User.findById(req.user._id).select('+refreshTokens');
-  if (user && refreshToken) {
-    user.refreshTokens = user.refreshTokens.filter(t => t !== refreshToken);
+  const user = await User.findById(req.user._id).select('+refreshTokens fcmToken');
+  if (user) {
+    // Remove refresh token
+    if (refreshToken) {
+      user.refreshTokens = user.refreshTokens.filter((t) => t !== refreshToken);
+    }
+
+    // Unsubscribe all FCM topics if user has a token
+    if (user.fcmToken) {
+      const activeSubs = await Subscription.find({ userId: user._id, isActive: true }).lean();
+
+      if (activeSubs.length) {
+        await Promise.allSettled(
+          activeSubs.map((sub) =>
+            admin.messaging().unsubscribeFromTopic(user.fcmToken, sub.topic)
+          )
+        );
+
+        await Subscription.updateMany(
+          { userId: user._id, isActive: true },
+          { $set: { deviceToken: null } }
+        );
+      }
+
+      user.fcmToken = null;
+    }
+
     await user.save({ validateBeforeSave: false });
   }
 
@@ -148,13 +173,69 @@ const getMe = asyncHandler(async (req, res) => {
 });
 
 // ── PUT /api/auth/fcm-token ───────────────────
+/*
+ * Called on every app launch and after login.
+ * Detects token change → triggers full topic recovery.
+ * On first registration with no existing subs → auto-subscribes
+ * user to their role topic + team_all.
+ *
+ * This is the RECOVERY ENTRY POINT after:
+ *   - App reinstall
+ *   - FCM token rotation
+ *   - Device change
+ */
 const updateFCMToken = asyncHandler(async (req, res) => {
   const { fcmToken } = req.body;
   if (!fcmToken) throw new ApiError(400, 'fcmToken is required');
 
-  await User.findByIdAndUpdate(req.user._id, { fcmToken });
+  const user = await User.findById(req.user._id).select('fcmToken role');
+  if (!user) throw new ApiError(404, 'User not found');
 
-  res.json({ success: true, message: 'FCM token updated' });
+  const isNewToken = user.fcmToken !== fcmToken;
+
+  user.fcmToken = fcmToken;
+  await user.save({ validateBeforeSave: false });
+
+  let recovery = null;
+
+  if (isNewToken) {
+    const activeSubs = await Subscription.find({ userId: user._id, isActive: true }).lean();
+
+    if (activeSubs.length === 0) {
+      // First time ever — bootstrap role + team subscriptions
+      await Promise.allSettled([
+        subscribeToTopic({ userId: user._id, entityId: user.role, entityType: 'role' }),
+        subscribeToTopic({ userId: user._id, entityId: 'all',     entityType: 'team' }),
+      ]);
+      recovery = { bootstrapped: true, topics: [`role_${user.role}`, 'team_all'] };
+    } else {
+      // Token rotated — resubscribe all existing topics in Firebase
+      const results = await Promise.allSettled(
+        activeSubs.map((sub) => admin.messaging().subscribeToTopic(fcmToken, sub.topic))
+      );
+
+      await Subscription.updateMany(
+        { userId: user._id, isActive: true },
+        { $set: { deviceToken: fcmToken } }
+      );
+
+      recovery = {
+        restored: results.filter((r) => r.status === 'fulfilled').length,
+        failed:   results.filter((r) => r.status === 'rejected').length,
+        total:    activeSubs.length,
+      };
+    }
+  }
+
+  res.json({
+    success: true,
+    message: recovery
+      ? recovery.bootstrapped
+        ? `Token registered. Subscribed to ${recovery.topics.join(', ')}.`
+        : `Token registered. ${recovery.restored}/${recovery.total} subscriptions restored.`
+      : 'Token is already up to date.',
+    data: { recovery },
+  });
 });
 
 module.exports = { register, login, refresh, logout, getMe, updateFCMToken };

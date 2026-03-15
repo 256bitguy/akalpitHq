@@ -1,11 +1,9 @@
-const LeadUpdate = require('./lead.model');
-const ApiError   = require('../../utils/ApiError');
+const LeadUpdate   = require('./lead.model');
+const ApiError     = require('../../utils/ApiError');
 const asyncHandler = require('../../utils/asyncHandler');
-const { sendToTopic } = require('../../services/fcm.service');
+const { notifyTopic, topicFor } = require('../../utils/notify.js');
 
 // ── GET /api/lead-updates ─────────────────────
-// Admin/HR sees all — leads see all too (read only)
-// Filter by ?leadId= to get one lead's updates
 const getLeadUpdates = asyncHandler(async (req, res) => {
   const { leadId } = req.query;
 
@@ -13,14 +11,22 @@ const getLeadUpdates = asyncHandler(async (req, res) => {
   if (leadId) filter.lead = leadId;
 
   const updates = await LeadUpdate.find(filter)
-    .populate('lead',          'name initials colorHex designation leadField')
-    .populate('reactions.user','name initials colorHex')
+    .populate('lead',           'name initials colorHex designation leadField')
+    .populate('reactions.user', 'name initials colorHex')
     .sort({ createdAt: -1 });
 
   res.json({ success: true, count: updates.length, updates });
 });
 
 // ── POST /api/lead-updates ────────────────────
+/*
+ * NOTIFICATION: LEAD_UPDATE — topic-based
+ * Broadcasts to:
+ *   role_admin  → all admins (Vivek)
+ *   role_hr     → all HR (Vaishnavi)
+ *   role_lead   → all other leads (peer visibility)
+ * No in-app docs — topic broadcast only.
+ */
 const createLeadUpdate = asyncHandler(async (req, res) => {
   const { title, body, tag } = req.body;
 
@@ -37,14 +43,26 @@ const createLeadUpdate = asyncHandler(async (req, res) => {
 
   await update.populate('lead', 'name initials colorHex designation leadField');
 
-  // FCM push to admin and hr
-  sendToTopic('role_admin', {
-    title: `🗂️ Lead Update — ${req.user.name}`,
-    body:  title,
-    data:  { type: 'lead_update', updateId: update._id.toString() },
-  });
+  // Broadcast to admin, HR, and other leads via FCM topics
+  const notifyPayload = {
+    type:    'LEAD_UPDATE',
+    title:   `🗂️ ${req.user.name} — ${title}`,
+    body:    body.slice(0, 100),
+    payload: {
+      screen:    'LeadUpdates',
+      entityId:  update._id.toString(),
+      actorId:   req.user._id.toString(),
+      actorName: req.user.name,
+      extra:     { field: req.user.leadField || '' },
+    },
+  };
 
-  // Notify all via socket
+  await Promise.allSettled([
+    notifyTopic({ topic: topicFor({ entityType: 'role', entityId: 'admin' }), ...notifyPayload }),
+    notifyTopic({ topic: topicFor({ entityType: 'role', entityId: 'hr'    }), ...notifyPayload }),
+    notifyTopic({ topic: topicFor({ entityType: 'role', entityId: 'lead'  }), ...notifyPayload }),
+  ]);
+
   req.app.get('io').emit('lead:new_update', { update });
 
   res.status(201).json({ success: true, update });
@@ -58,12 +76,9 @@ const addReaction = asyncHandler(async (req, res) => {
   const update = await LeadUpdate.findById(req.params.id);
   if (!update) throw new ApiError(404, 'Lead update not found');
 
-  // Remove existing reaction from this user if any
   update.reactions = update.reactions.filter(
-    r => r.user.toString() !== req.user._id.toString()
+    (r) => r.user.toString() !== req.user._id.toString()
   );
-
-  // Add new reaction
   update.reactions.push({ user: req.user._id, emoji });
   await update.save();
 
@@ -78,7 +93,7 @@ const removeReaction = asyncHandler(async (req, res) => {
   if (!update) throw new ApiError(404, 'Lead update not found');
 
   update.reactions = update.reactions.filter(
-    r => r.user.toString() !== req.user._id.toString()
+    (r) => r.user.toString() !== req.user._id.toString()
   );
   await update.save();
 
@@ -90,7 +105,6 @@ const deleteLeadUpdate = asyncHandler(async (req, res) => {
   const update = await LeadUpdate.findById(req.params.id);
   if (!update) throw new ApiError(404, 'Lead update not found');
 
-  // Only owner or admin can delete
   const isOwner = update.lead.toString() === req.user._id.toString();
   const isAdmin = ['admin', 'hr'].includes(req.user.role);
   if (!isOwner && !isAdmin) throw new ApiError(403, 'Not authorized');

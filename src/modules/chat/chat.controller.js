@@ -2,7 +2,14 @@ const Conversation = require('./conversation.model');
 const Message      = require('./message.model');
 const ApiError     = require('../../utils/ApiError');
 const asyncHandler = require('../../utils/asyncHandler');
-const { sendToUsers } = require('../../services/fcm.service');
+const {
+  notify,
+  notifyMany,
+  notifyTopic,
+  topicFor,
+  subscribeToTopic,
+  unsubscribeFromTopic,
+} = require('../../utils/notify.js');
 
 // ── GET /api/chat/conversations ───────────────
 const getConversations = asyncHandler(async (req, res) => {
@@ -11,10 +18,9 @@ const getConversations = asyncHandler(async (req, res) => {
     .populate('lastMessage.sender', 'name initials')
     .sort({ 'lastMessage.sentAt': -1 });
 
-  // Attach unread count for current user
-  const result = conversations.map(conv => {
-    const obj        = conv.toObject();
-    obj.unreadCount  = conv.unreadCounts.get(req.user._id.toString()) || 0;
+  const result = conversations.map((conv) => {
+    const obj       = conv.toObject();
+    obj.unreadCount = conv.unreadCounts.get(req.user._id.toString()) || 0;
     return obj;
   });
 
@@ -36,6 +42,10 @@ const getConversationById = asyncHandler(async (req, res) => {
 });
 
 // ── POST /api/chat/dm ─────────────────────────
+/*
+ * DM: no topic subscription needed.
+ * Direct messages use token-based notify() in sendMessage().
+ */
 const createOrGetDM = asyncHandler(async (req, res) => {
   const { targetUserId } = req.body;
 
@@ -44,7 +54,6 @@ const createOrGetDM = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Cannot DM yourself');
   }
 
-  // Return existing DM if found
   let conversation = await Conversation.findOne({
     type:    'dm',
     members: { $all: [req.user._id, targetUserId], $size: 2 },
@@ -62,15 +71,20 @@ const createOrGetDM = asyncHandler(async (req, res) => {
 });
 
 // ── POST /api/chat/group ──────────────────────
+/*
+ * GROUP CHAT — topic-based
+ * On creation:
+ *   1. Subscribe ALL members (including creator) to group_{conversationId}
+ *   2. Token-based notify to non-creator members (GROUP_ADDED)
+ */
 const createGroup = asyncHandler(async (req, res) => {
   const { name, emoji, memberIds } = req.body;
 
-  if (!name?.trim())              throw new ApiError(400, 'Group name is required');
+  if (!name?.trim())             throw new ApiError(400, 'Group name is required');
   if (!memberIds || memberIds.length < 2) {
     throw new ApiError(400, 'A group needs at least 2 other members');
   }
 
-  // Always include creator
   const allMembers = [...new Set([req.user._id.toString(), ...memberIds])];
 
   const conversation = await Conversation.create({
@@ -83,21 +97,44 @@ const createGroup = asyncHandler(async (req, res) => {
 
   await conversation.populate('members', 'name initials colorHex status designation');
 
-  // Notify other members via socket
+  // Socket: notify other members
   const io = req.app.get('io');
-  conversation.members.forEach(m => {
+  conversation.members.forEach((m) => {
     if (m._id.toString() !== req.user._id.toString()) {
       io.to(m._id.toString()).emit('chat:group_created', { conversation });
     }
   });
 
-  // FCM push
-  const otherIds = memberIds.filter(id => id !== req.user._id.toString());
-  sendToUsers(otherIds, {
-    title: `💬 ${req.user.name} added you to "${name}"`,
-    body:  'Tap to open the group chat',
-    data:  { type: 'group_added', conversationId: conversation._id.toString() },
-  });
+  // Subscribe ALL members to the group FCM topic
+  await Promise.allSettled(
+    allMembers.map((userId) =>
+      subscribeToTopic({
+        userId,
+        entityId:   conversation._id.toString(),
+        entityType: 'group',
+      })
+    )
+  );
+
+  // Token-based notify to non-creator members
+  const otherIds = memberIds.filter((id) => id !== req.user._id.toString());
+
+  if (otherIds.length) {
+    await notifyMany({
+      recipientIds: otherIds,
+      senderId:     req.user._id,
+      type:         'GROUP_ADDED',
+      title:        `💬 ${req.user.name} added you to "${name}"`,
+      body:         'Tap to open the group chat',
+      payload: {
+        screen:    'ChatDetail',
+        entityId:  conversation._id.toString(),
+        actorId:   req.user._id.toString(),
+        actorName: req.user.name,
+        extra:     { groupName: name },
+      },
+    });
+  }
 
   res.status(201).json({ success: true, conversation });
 });
@@ -127,6 +164,10 @@ const updateGroup = asyncHandler(async (req, res) => {
 });
 
 // ── POST /api/chat/group/:id/members ─────────
+/*
+ * When adding members: subscribe them to group topic + notify (GROUP_ADDED)
+ * When removing members: unsubscribe them from group topic
+ */
 const updateGroupMembers = asyncHandler(async (req, res) => {
   const { memberIds, action } = req.body;
 
@@ -148,14 +189,14 @@ const updateGroupMembers = asyncHandler(async (req, res) => {
   }
 
   if (action === 'add') {
-    memberIds.forEach(id => {
-      if (!conversation.members.some(m => m._id.toString() === id)) {
+    memberIds.forEach((id) => {
+      if (!conversation.members.some((m) => m._id.toString() === id)) {
         conversation.members.push(id);
       }
     });
   } else {
     conversation.members = conversation.members.filter(
-      m => !memberIds.includes(m._id.toString())
+      (m) => !memberIds.includes(m._id.toString())
     );
   }
 
@@ -167,6 +208,48 @@ const updateGroupMembers = asyncHandler(async (req, res) => {
     members:        conversation.members,
     action,
   });
+
+  if (action === 'add') {
+    // Subscribe new members to group topic
+    await Promise.allSettled(
+      memberIds.map((userId) =>
+        subscribeToTopic({
+          userId,
+          entityId:   conversation._id.toString(),
+          entityType: 'group',
+        })
+      )
+    );
+
+    // Notify newly added members
+    const newIds = memberIds.filter((id) => id !== req.user._id.toString());
+    if (newIds.length) {
+      await notifyMany({
+        recipientIds: newIds,
+        senderId:     req.user._id,
+        type:         'GROUP_ADDED',
+        title:        `💬 ${req.user.name} added you to "${conversation.name}"`,
+        body:         'Tap to open the group chat',
+        payload: {
+          screen:    'ChatDetail',
+          entityId:  conversation._id.toString(),
+          actorId:   req.user._id.toString(),
+          actorName: req.user.name,
+          extra:     { groupName: conversation.name },
+        },
+      });
+    }
+  } else {
+    // Unsubscribe removed members from group topic
+    await Promise.allSettled(
+      memberIds.map((userId) =>
+        unsubscribeFromTopic({
+          userId,
+          entityId: conversation._id.toString(),
+        })
+      )
+    );
+  }
 
   res.json({ success: true, conversation });
 });
@@ -188,14 +271,12 @@ const getMessages = asyncHandler(async (req, res) => {
     .limit(Number(limit))
     .skip((Number(page) - 1) * Number(limit));
 
-  // Mark messages as read
-  const ids = messages.map(m => m._id);
+  const ids = messages.map((m) => m._id);
   await Message.updateMany(
     { _id: { $in: ids }, readBy: { $ne: req.user._id } },
     { $addToSet: { readBy: req.user._id } }
   );
 
-  // Reset unread count
   conversation.resetUnread(req.user._id);
   await conversation.save();
 
@@ -211,6 +292,16 @@ const getMessages = asyncHandler(async (req, res) => {
 });
 
 // ── POST /api/chat/conversations/:id/messages ─
+/*
+ * NOTIFICATION: NEW_MESSAGE
+ *
+ * DM  → token-based notify() to the other member
+ * Group → notifyTopic() to group_{conversationId}
+ *         (all members subscribed to the topic receive it)
+ *         The sender is NOT excluded at FCM level, but Flutter
+ *         should suppress the notification if conversationId
+ *         matches the currently open chat screen.
+ */
 const sendMessage = asyncHandler(async (req, res) => {
   const { text, replyTo } = req.body;
   if (!text?.trim()) throw new ApiError(400, 'Message text is required');
@@ -231,7 +322,6 @@ const sendMessage = asyncHandler(async (req, res) => {
 
   await message.populate('sender', 'name initials colorHex');
 
-  // Update conversation snapshot
   conversation.lastMessage = {
     text:   text.trim(),
     sender: req.user._id,
@@ -240,22 +330,51 @@ const sendMessage = asyncHandler(async (req, res) => {
   conversation.incrementUnread(req.user._id);
   await conversation.save();
 
-  // Broadcast via socket
+  // Socket broadcast
   req.app.get('io')
     .to(req.params.id)
     .emit('chat:new_message', { message, conversationId: req.params.id });
 
-  // FCM push to other members
-  const otherIds = conversation.members.filter(
-    m => m.toString() !== req.user._id.toString()
-  );
-  sendToUsers(otherIds, {
-    title: conversation.type === 'group'
-      ? `${conversation.name}: ${req.user.name}`
-      : req.user.name,
-    body:  text.trim().slice(0, 100),
-    data:  { type: 'new_message', conversationId: req.params.id },
-  });
+  // ── FCM push ─────────────────────────────────
+  if (conversation.type === 'dm') {
+    // DM: direct token-based push to the other person only
+    const otherId = conversation.members.find(
+      (m) => m.toString() !== req.user._id.toString()
+    );
+
+    if (otherId) {
+      await notify({
+        recipientId: otherId,
+        senderId:    req.user._id,
+        type:        'NEW_MESSAGE',
+        title:       req.user.name,
+        body:        text.trim().slice(0, 100),
+        payload: {
+          screen:    'ChatDetail',
+          entityId:  conversation._id.toString(),
+          actorId:   req.user._id.toString(),
+          actorName: req.user.name,
+          extra:     { type: 'dm' },
+        },
+      });
+    }
+  } else {
+    // Group: topic-based broadcast to group_{conversationId}
+    // No in-app doc saved (broadcast, not personal)
+    await notifyTopic({
+      topic:   topicFor({ entityType: 'group', entityId: conversation._id.toString() }),
+      type:    'NEW_MESSAGE',
+      title:   `${conversation.name}: ${req.user.name}`,
+      body:    text.trim().slice(0, 100),
+      payload: {
+        screen:    'ChatDetail',
+        entityId:  conversation._id.toString(),
+        actorId:   req.user._id.toString(),
+        actorName: req.user.name,
+        extra:     { type: 'group', groupName: conversation.name },
+      },
+    });
+  }
 
   res.status(201).json({ success: true, message });
 });
@@ -282,6 +401,9 @@ const deleteMessage = asyncHandler(async (req, res) => {
 });
 
 // ── DELETE /api/chat/conversations/:id ────────
+/*
+ * When user leaves a group → unsubscribe from group topic
+ */
 const leaveConversation = asyncHandler(async (req, res) => {
   const conversation = await Conversation.findOne({
     _id:     req.params.id,
@@ -293,9 +415,14 @@ const leaveConversation = asyncHandler(async (req, res) => {
     return res.json({ success: true, message: 'DM archived' });
   }
 
-  // Remove from group
+  // Unsubscribe from group FCM topic
+  await unsubscribeFromTopic({
+    userId:   req.user._id,
+    entityId: conversation._id.toString(),
+  });
+
   conversation.members = conversation.members.filter(
-    m => m.toString() !== req.user._id.toString()
+    (m) => m.toString() !== req.user._id.toString()
   );
 
   if (conversation.members.length === 0) {
@@ -303,7 +430,6 @@ const leaveConversation = asyncHandler(async (req, res) => {
     return res.json({ success: true, message: 'Group deleted — no members left' });
   }
 
-  // Reassign admin if admin left
   if (conversation.admin.toString() === req.user._id.toString()) {
     conversation.admin = conversation.members[0];
   }

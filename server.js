@@ -38,6 +38,7 @@ app.use('/api/tasks',        require('./src/modules/task/task.routes'));
 app.use('/api/chat',         require('./src/modules/chat/chat.routes'));
 app.use('/api/hr-updates',   require('./src/modules/hr/hr.routes'));
 app.use('/api/lead-updates', require('./src/modules/lead/lead.routes'));
+app.use('/api/notifications', require('./src/modules/notification/notification.routes.js'));
 
 // ── 404 ───────────────────────────────────────
 app.use((req, res) => {

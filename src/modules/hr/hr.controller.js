@@ -1,7 +1,7 @@
-const HRUpdate   = require('./hr.model');
-const ApiError   = require('../../utils/ApiError');
+const HRUpdate     = require('./hr.model');
+const ApiError     = require('../../utils/ApiError');
 const asyncHandler = require('../../utils/asyncHandler');
-const { sendToTopic } = require('../../services/fcm.service');
+const { notifyTopic, topicFor } = require('../../utils/notify.js');
 
 // ── GET /api/hr-updates ───────────────────────
 const getHRUpdates = asyncHandler(async (req, res) => {
@@ -14,6 +14,11 @@ const getHRUpdates = asyncHandler(async (req, res) => {
 });
 
 // ── POST /api/hr-updates ──────────────────────
+/*
+ * NOTIFICATION: HR_UPDATE — topic-based to team_all
+ * Broadcasts to every team member via FCM topic team_all.
+ * No individual in-app docs — it's a company-wide broadcast.
+ */
 const createHRUpdate = asyncHandler(async (req, res) => {
   const { title, body, phase, phaseRef, milestones } = req.body;
 
@@ -25,20 +30,27 @@ const createHRUpdate = asyncHandler(async (req, res) => {
     body,
     phase:      phase      || 'General',
     phaseRef:   phaseRef   || null,
-    milestones: (milestones || []).map(text => ({ text, done: false })),
+    milestones: (milestones || []).map((text) => ({ text, done: false })),
     createdBy:  req.user._id,
   });
 
   await update.populate('createdBy', 'name initials colorHex designation');
 
-  // FCM push to all team members
-  sendToTopic('team_all', {
-    title: `📢 ${title}`,
-    body:  body.slice(0, 100),
-    data:  { type: 'hr_update', updateId: update._id.toString() },
+  // Broadcast to entire team via FCM topic
+  await notifyTopic({
+    topic:   topicFor({ entityType: 'team', entityId: 'all' }),
+    type:    'HR_UPDATE',
+    title:   `📢 HR — ${title}`,
+    body:    body.slice(0, 100),
+    payload: {
+      screen:    'HRUpdates',
+      entityId:  update._id.toString(),
+      actorId:   req.user._id.toString(),
+      actorName: req.user.name,
+      extra:     { phase: phase || 'General' },
+    },
   });
 
-  // Notify all via socket
   req.app.get('io').emit('hr:new_update', { update });
 
   res.status(201).json({ success: true, update });
@@ -52,7 +64,6 @@ const toggleMilestone = asyncHandler(async (req, res) => {
   const milestone = update.milestones.id(req.params.msId);
   if (!milestone) throw new ApiError(404, 'Milestone not found');
 
-  // Toggle
   milestone.done = !milestone.done;
 
   if (milestone.done) {
