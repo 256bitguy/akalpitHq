@@ -229,8 +229,8 @@ const getMyNotifications = asyncHandler(async (req, res) => {
       .skip(skip)
       .limit(pageLimit)
       .lean(),
-    Notification.countDocuments(filter),
-    Notification.countDocuments({ recipientId: userId, isRead: false }),
+    NotificationModel.countDocuments(filter),
+    NotificationModel.countDocuments({ recipientId: userId, isRead: false }),
   ]);
 
   return res.json({
