@@ -338,8 +338,9 @@ const sendMessage = asyncHandler(async (req, res) => {
   // ── FCM push ─────────────────────────────────
   if (conversation.type === 'dm') {
     // DM: direct token-based push to the other person only
+    // Use m._id if populated (User object), else m directly (ObjectId)
     const otherId = conversation.members.find(
-      (m) => m.toString() !== req.user._id.toString()
+      (m) => (m._id ?? m).toString() !== req.user._id.toString()
     );
 
     if (otherId) {
