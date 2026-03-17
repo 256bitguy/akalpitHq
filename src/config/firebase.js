@@ -1,8 +1,11 @@
-let firebaseApp;
+const admin = require('firebase-admin');
 
-const getFirebase = () => {
-  if (!firebaseApp) {
-    const admin = require('firebase-admin');
+// Initialise lazily — called the first time messaging() is needed,
+// guaranteeing dotenv has already loaded process.env values.
+let initialised = false;
+
+function ensureInitialised() {
+  if (!initialised) {
     if (!admin.apps.length) {
       admin.initializeApp({
         credential: admin.credential.cert({
@@ -12,9 +15,16 @@ const getFirebase = () => {
         }),
       });
     }
-    firebaseApp = admin;
+    initialised = true;
   }
-  return firebaseApp;
-};
+}
 
-module.exports = getFirebase();
+// Proxy object — same API as before (admin.messaging(), etc.)
+// but init is deferred until first use.
+module.exports = new Proxy(admin, {
+  get(target, prop) {
+    ensureInitialised();
+    const value = target[prop];
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});

@@ -1,16 +1,11 @@
-const mongoose       = require('mongoose');
-// const admin          = require('../config/firebase');
-// const User           = require('../modules/user/user.model');
-// const Subscription   = require('./subscription.model');
-// const Notification   = require('./notification.model');
-// const ApiError       = require('../utils/ApiError');
-// const asyncHandler   = require('');
+const mongoose          = require('mongoose');
+const admin             = require('../../config/firebase');
+const User              = require('../user/user.model');
 const { subscribeToTopic, topicFor } = require('../../utils/notify.js');
-const Subscription = require('../subscription/subscription.model.js');
+const Subscription      = require('../subscription/subscription.model.js');
 const NotificationModel = require('./notification.model.js');
-const userModel = require('../user/user.model.js');
-const ApiError = require('../../utils/ApiError.js');
-const asyncHandler = require('../../utils/asyncHandler.js');
+const ApiError          = require('../../utils/ApiError.js');
+const asyncHandler      = require('../../utils/asyncHandler.js');
 
 /*
  * NOTIFICATION CONTROLLER
@@ -36,16 +31,11 @@ async function resubscribeAllTopics(userId, newToken) {
   const activeSubs = await Subscription.find({ userId, isActive: true }).lean();
   if (!activeSubs.length) return { restored: 0, failed: 0, total: 0 };
 
+  // Route through subscribeToTopic() so deviceToken snapshot stays in sync.
   const results = await Promise.allSettled(
     activeSubs.map((sub) =>
-      admin.messaging().subscribeToTopic(newToken, sub.topic)
+      subscribeToTopic({ userId, entityId: sub.entityId, entityType: sub.entityType })
     )
-  );
-
-  // Update token snapshot in one write
-  await Subscription.updateMany(
-    { userId, isActive: true },
-    { $set: { deviceToken: newToken } }
   );
 
   return {
@@ -71,10 +61,12 @@ const registerFcmToken = asyncHandler(async (req, res) => {
 
   if (!fcmToken?.trim()) throw new ApiError(400, 'fcmToken is required');
 
-  const user = await userModel.findById(userId).select('fcmToken role');
+  const user = await User.findById(userId).select('fcmToken role');
   if (!user) throw new ApiError(404, 'User not found');
 
-  const isNewToken = user.fcmToken !== fcmToken;
+  // Capture BEFORE overwriting so comparison is against the old value
+  const wasTokenNull = !user.fcmToken;
+  const isNewToken   = user.fcmToken !== fcmToken;
 
   // Always overwrite — single token per user
   user.fcmToken = fcmToken;
@@ -82,7 +74,7 @@ const registerFcmToken = asyncHandler(async (req, res) => {
 
   let recovery = null;
 
-  if (isNewToken || !user.fcmToken) {
+  if (isNewToken || wasTokenNull) {
     // ── Auto-subscribe to role topic + team_all if no existing subs ──
     const existingSubs = await Subscription.countDocuments({ userId, isActive: true });
 

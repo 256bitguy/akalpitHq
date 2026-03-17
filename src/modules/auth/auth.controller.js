@@ -5,7 +5,6 @@ const asyncHandler = require('../../utils/asyncHandler');
 const { generateAccessToken, generateRefreshToken, verifyRefreshToken } = require('../../utils/tokens');
 const { subscribeToTopic, unsubscribeFromTopic } = require('../../utils/notify.js');
 const Subscription = require('../../modules/subscription/subscription.model.js');
-const admin = require('../../config/firebase');
 
 // ── POST /api/auth/register ───────────────────
 const register = asyncHandler(async (req, res) => {
@@ -142,16 +141,13 @@ const logout = asyncHandler(async (req, res) => {
     if (user.fcmToken) {
       const activeSubs = await Subscription.find({ userId: user._id, isActive: true }).lean();
 
+      // Route through unsubscribeFromTopic() so deviceToken snapshots
+      // are nulled in the Subscription docs automatically.
       if (activeSubs.length) {
         await Promise.allSettled(
           activeSubs.map((sub) =>
-            admin.messaging().unsubscribeFromTopic(user.fcmToken, sub.topic)
+            unsubscribeFromTopic({ userId: user._id, entityId: sub.entityId })
           )
-        );
-
-        await Subscription.updateMany(
-          { userId: user._id, isActive: true },
-          { $set: { deviceToken: null } }
         );
       }
 
@@ -191,14 +187,16 @@ const updateFCMToken = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user._id).select('fcmToken role');
   if (!user) throw new ApiError(404, 'User not found');
 
-  const isNewToken = user.fcmToken !== fcmToken;
+  // Capture BEFORE overwriting so comparison is against the old value
+  const wasTokenNull = !user.fcmToken;
+  const isNewToken   = user.fcmToken !== fcmToken;
 
   user.fcmToken = fcmToken;
   await user.save({ validateBeforeSave: false });
 
   let recovery = null;
 
-  if (isNewToken) {
+  if (isNewToken || wasTokenNull) {
     const activeSubs = await Subscription.find({ userId: user._id, isActive: true }).lean();
 
     if (activeSubs.length === 0) {
@@ -209,14 +207,12 @@ const updateFCMToken = asyncHandler(async (req, res) => {
       ]);
       recovery = { bootstrapped: true, topics: [`role_${user.role}`, 'team_all'] };
     } else {
-      // Token rotated — resubscribe all existing topics in Firebase
+      // Token rotated — resubscribe via subscribeToTopic() so deviceToken
+      // snapshots in Subscription docs are kept in sync automatically.
       const results = await Promise.allSettled(
-        activeSubs.map((sub) => admin.messaging().subscribeToTopic(fcmToken, sub.topic))
-      );
-
-      await Subscription.updateMany(
-        { userId: user._id, isActive: true },
-        { $set: { deviceToken: fcmToken } }
+        activeSubs.map((sub) =>
+          subscribeToTopic({ userId: user._id, entityId: sub.entityId, entityType: sub.entityType })
+        )
       );
 
       recovery = {
